@@ -5,6 +5,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 from src.excel_reader import read_excel
@@ -34,16 +35,69 @@ template_files = st.file_uploader(
     help="한글에서 '다른 이름으로 저장' → HWPX 형식 선택",
 )
 
-# --- 2. 엑셀 업로드 ---
-st.header("2단계: 엑셀 파일 업로드")
-st.markdown(
-    "첫 번째 행(헤더)에 템플릿의 플레이스홀더 이름과 동일한 컬럼명을 넣어주세요."
-)
-data_file = st.file_uploader(
-    "엑셀 데이터 파일",
-    type=["xlsx", "xls"],
-    help="첫 번째 행이 헤더, 나머지가 데이터",
-)
+# --- 2. 데이터 입력 (탭: 엑셀 업로드 / 웹에서 직접 입력) ---
+st.header("2단계: 데이터 입력")
+
+tab_excel, tab_web = st.tabs(["📁 엑셀 파일 업로드", "✏️ 웹에서 직접 입력"])
+
+with tab_excel:
+    st.markdown(
+        "첫 번째 행(헤더)에 템플릿의 플레이스홀더 이름과 동일한 컬럼명을 넣어주세요."
+    )
+    data_file = st.file_uploader(
+        "엑셀 데이터 파일",
+        type=["xlsx", "xls"],
+        help="첫 번째 행이 헤더, 나머지가 데이터",
+    )
+
+with tab_web:
+    st.markdown(
+        "템플릿을 먼저 업로드하면 플레이스홀더가 자동으로 컬럼에 표시됩니다. "
+        "아래 표에서 직접 데이터를 입력하세요."
+    )
+
+    # 템플릿에서 플레이스홀더 추출하여 컬럼 자동 생성
+    all_placeholders = []
+    if template_files:
+        with tempfile.TemporaryDirectory() as _tmpdir:
+            for tf in template_files:
+                _tp = Path(_tmpdir) / tf.name
+                _tp.write_bytes(tf.getvalue())
+                try:
+                    phs = find_placeholders_in_template(_tp)
+                    all_placeholders.extend(phs)
+                except Exception:
+                    pass
+        # 중복 제거 (순서 유지)
+        all_placeholders = list(dict.fromkeys(all_placeholders))
+
+    if all_placeholders:
+        st.caption(f"감지된 플레이스홀더: `{'`, `'.join(all_placeholders)}`")
+        columns = all_placeholders
+    else:
+        st.info("템플릿을 업로드하면 컬럼이 자동으로 설정됩니다. 또는 직접 컬럼명을 입력하세요.")
+        custom_cols = st.text_input(
+            "컬럼명 (쉼표로 구분)",
+            value="",
+            placeholder="예: 매도인, 매수인, 가격",
+            key="custom_columns",
+        )
+        columns = [c.strip() for c in custom_cols.split(",") if c.strip()] if custom_cols else []
+
+    if columns:
+        # 초기 빈 행 1개로 편집 가능한 데이터프레임 생성
+        if "web_input_df" not in st.session_state or set(st.session_state.web_input_df.columns) != set(columns):
+            st.session_state.web_input_df = pd.DataFrame(
+                [{col: "" for col in columns}],
+            )
+
+        edited_df = st.data_editor(
+            st.session_state.web_input_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="web_editor",
+        )
+        st.session_state.web_input_df = edited_df
 
 # --- 3. 옵션 ---
 st.header("3단계: 옵션 설정")
@@ -52,14 +106,41 @@ with col1:
     filename_pattern = st.text_input(
         "파일명 패턴",
         value="{매도인}",
-        help="엑셀 컬럼명을 중괄호로 감싸서 사용 (예: {매도인})",
+        help="컬럼명을 중괄호로 감싸서 사용 (예: {매도인})",
     )
 with col2:
     st.markdown("&nbsp;")  # spacer
     st.info("예시: `{매도인}` → `홍길동_토지거래계약 허가 신청서.hwpx`\n\n템플릿 이름이 자동으로 붙습니다.")
 
-# --- 4. 실행 ---
+
+# --- 데이터 소스 결정 ---
+def _get_rows_from_web_editor() -> list[dict[str, str]] | None:
+    """웹 편집기에서 입력된 데이터를 rows 형식으로 변환한다."""
+    if "web_input_df" not in st.session_state:
+        return None
+    df = st.session_state.web_input_df
+    if df.empty or df.columns.empty:
+        return None
+    # 모든 셀이 빈 행은 제외
+    rows = []
+    for _, row in df.iterrows():
+        record = {col: str(val) if val is not None and str(val).strip() else "" for col, val in row.items()}
+        if any(v for v in record.values()):
+            rows.append(record)
+    return rows if rows else None
+
+
+# 엑셀 업로드 데이터가 있으면 우선 사용, 없으면 웹 입력 확인
+rows = None
+data_source = None
+
 if template_files and data_file:
+    data_source = "excel"
+elif template_files and _get_rows_from_web_editor():
+    data_source = "web"
+
+# --- 4. 실행 ---
+if template_files and data_source:
     st.divider()
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -72,24 +153,31 @@ if template_files and data_file:
             tp.write_bytes(tf.getvalue())
             template_paths.append(tp)
 
-        # 엑셀 저장 & 읽기
-        data_path = tmpdir / data_file.name
-        data_path.write_bytes(data_file.getvalue())
+        # 데이터 읽기
+        if data_source == "excel":
+            data_path = tmpdir / data_file.name
+            data_path.write_bytes(data_file.getvalue())
+            try:
+                rows = read_excel(data_path)
+            except (FileNotFoundError, ValueError) as e:
+                st.error(f"엑셀 오류: {e}")
+                st.stop()
+        else:
+            rows = _get_rows_from_web_editor()
 
-        try:
-            rows = read_excel(data_path)
-        except (FileNotFoundError, ValueError) as e:
-            st.error(f"엑셀 오류: {e}")
+        if not rows:
+            st.warning("데이터가 비어있습니다.")
             st.stop()
 
         # 미리보기
         st.subheader("📋 미리보기")
 
-        st.markdown(f"**엑셀 데이터:** {len(rows)}행")
+        source_label = "엑셀" if data_source == "excel" else "웹 입력"
+        st.markdown(f"**데이터 ({source_label}):** {len(rows)}행")
         st.dataframe(rows, use_container_width=True)
 
         st.markdown(f"**템플릿:** {len(template_paths)}개")
-        excel_headers = set(rows[0].keys()) if rows else set()
+        data_headers = set(rows[0].keys()) if rows else set()
 
         for tp in template_paths:
             try:
@@ -98,8 +186,8 @@ if template_files and data_file:
                 st.error(f"{tp.name}: {e}")
                 continue
 
-            matched = set(placeholders) & excel_headers
-            unmatched = set(placeholders) - excel_headers
+            matched = set(placeholders) & data_headers
+            unmatched = set(placeholders) - data_headers
             status = "✅" if not unmatched else "⚠️"
             detail = f"플레이스홀더: {', '.join(placeholders)}" if placeholders else "플레이스홀더 없음"
             if unmatched:
@@ -176,4 +264,4 @@ if template_files and data_file:
                         )
 else:
     st.divider()
-    st.info("👆 위에서 템플릿과 엑셀 파일을 업로드하면 시작됩니다.")
+    st.info("👆 위에서 템플릿을 업로드하고 데이터를 입력하면 시작됩니다.")
