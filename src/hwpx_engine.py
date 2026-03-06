@@ -64,6 +64,8 @@ def _replace_in_section_xml(xml_bytes: bytes, data: dict[str, str]) -> tuple[byt
                 if placeholder in original:
                     original = original.replace(placeholder, value)
                     replaced.add(key)
+            # 매칭 안 된 플레이스홀더는 빈 값으로 치환
+            original = _PLACEHOLDER_PATTERN.sub("", original)
             t_elem.text = original
 
     # 2단계: 여러 run에 걸쳐 분할된 플레이스홀더 처리
@@ -108,6 +110,9 @@ def _fix_split_placeholders(
         if placeholder in new_combined:
             new_combined = new_combined.replace(placeholder, value)
             replaced.add(key)
+
+    # 매칭 안 된 플레이스홀더는 빈 값으로 치환
+    new_combined = _PLACEHOLDER_PATTERN.sub("", new_combined)
 
     if new_combined == combined:
         return
